@@ -71,3 +71,27 @@ truncation, mid-log corruption detection) run in CI-style form via:
 ```sh
 go test ./... -race -count=1
 ```
+
+## Cluster failover (3 nodes, one host)
+
+Three broker processes on one machine (`-election-timeout 200ms`,
+`-heartbeat-interval 50ms`), 25 records published and acknowledged with
+majority-ack, then the leader SIGKILLed. Time from kill to an elected,
+serving new leader:
+
+| Trial | Failover time | Acked records readable after |
+|---|---|---|
+| 1 | 264 ms | 25 / 25 |
+| 2 | 310 ms | 25 / 25 |
+| 3 | 372 ms | 25 / 25 |
+| 4 | 574 ms | 25 / 25 |
+
+Failover cost is dominated by the randomized election timeout (200–400ms
+window here). Every acknowledged record was readable from the new leader in
+every trial, and with two of three nodes killed the survivor refused writes
+instead of acknowledging records it could lose
+(`TestQuorumLossRejectsWrites`). Reproduce with:
+
+```sh
+go test ./tests/ -run 'TestFailover|TestQuorumLoss' -count=3 -v
+```

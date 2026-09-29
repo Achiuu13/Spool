@@ -78,13 +78,37 @@ All errors are JSON: `{"error": "<message>"}`.
 | 404 | Unknown stream or partition |
 | 413 | Record exceeds 1 MiB |
 | 500 | Internal storage error |
+| 307 | Cluster mode: this node is a follower; retry at `Location` (the leader) |
+| 503 | Cluster mode: no leader elected, or the proposal could not reach a majority — retry |
 
 Server timeouts: 10 s read, 30 s write, 60 s idle.
 
+## Cluster mode
+
+With `-peers`, the guarantees strengthen and shift (see
+[replication.md](replication.md) for the design):
+
+- A publish is acknowledged only after the record is durable (fsynced) on
+  a **majority** of the three nodes. Acknowledged records survive the
+  permanent loss of any single node, including the leader.
+- Committed consumer offsets are replicated the same way and survive
+  failover.
+- With a majority down, Spool refuses writes (`503`) rather than
+  acknowledge records it could lose.
+- A publish that got no response (crash mid-request) may or may not have
+  committed; producers must retry, which can duplicate records —
+  at-least-once, as in standalone mode.
+- Group membership lives on the leader only; after failover, consumers
+  get `404` on heartbeat and re-join, exactly as they do after session
+  expiry.
+
 ## Non-goals (this stage)
 
-- No replication: a lost disk loses data. "No acknowledged-write loss"
-  across node failure is the replication milestone's claim, not this one's.
+- Standalone mode is single-node: a lost disk loses data. The majority-ack
+  claim above applies to cluster mode only.
 - No exactly-once delivery.
-- No retention or compaction: logs grow without bound.
+- No retention or compaction: logs grow without bound (including the
+  cluster-mode operation log).
 - No authentication or TLS.
+- Cluster membership is static (the `-peers` list); no dynamic
+  reconfiguration.

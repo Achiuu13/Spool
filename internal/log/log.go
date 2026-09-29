@@ -134,13 +134,20 @@ func (l *Log) truncateAt(pos int64) error {
 	return nil
 }
 
-// Append writes a record, syncs per policy, and returns its offset.
+// Append writes a record stamped with the current time, syncs per policy,
+// and returns its offset.
 func (l *Log) Append(key, value []byte) (int64, error) {
+	return l.AppendRecord(time.Now().UnixNano(), key, value)
+}
+
+// AppendRecord writes a record with an explicit timestamp. Replicated apply
+// uses this so every node stores byte-identical frames.
+func (l *Log) AppendRecord(ts int64, key, value []byte) (int64, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	rec := Record{
 		Offset:    l.nextOffset,
-		Timestamp: time.Now().UnixNano(),
+		Timestamp: ts,
 		Key:       key,
 		Value:     value,
 	}
@@ -209,6 +216,27 @@ func (l *Log) Read(offset int64, max int) ([]Record, error) {
 		pos += frameHeader + int64(bodyLen)
 	}
 	return records, nil
+}
+
+// TruncateFrom discards the record at offset and everything after it. The
+// replication layer uses it to remove a follower's uncommitted entries that
+// conflict with the leader's log. Truncating at or past the end is a no-op.
+func (l *Log) TruncateFrom(offset int64) error {
+	if offset < 0 {
+		return ErrOffsetOutOfRange
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if offset >= l.nextOffset {
+		return nil
+	}
+	pos := l.positions[offset]
+	if err := l.truncateAt(pos); err != nil {
+		return err
+	}
+	l.positions = l.positions[:offset]
+	l.nextOffset = offset
+	return nil
 }
 
 // NextOffset returns the offset the next appended record will receive.
