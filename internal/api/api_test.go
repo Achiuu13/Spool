@@ -8,8 +8,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/anthonychiu/spool/internal/broker"
-	spoollog "github.com/anthonychiu/spool/internal/log"
+	"github.com/Achiuu13/spool/internal/broker"
+	spoollog "github.com/Achiuu13/spool/internal/log"
 )
 
 func newServer(t *testing.T) (*httptest.Server, string) {

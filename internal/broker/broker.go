@@ -10,8 +10,8 @@ import (
 	"regexp"
 	"sync"
 
-	spoollog "github.com/anthonychiu/spool/internal/log"
-	"github.com/anthonychiu/spool/internal/offsets"
+	spoollog "github.com/Achiuu13/spool/internal/log"
+	"github.com/Achiuu13/spool/internal/offsets"
 )
 
 // The single-partition version uses partition 0 throughout.

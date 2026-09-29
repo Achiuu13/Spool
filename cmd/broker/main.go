@@ -12,8 +12,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/anthonychiu/spool/internal/api"
-	"github.com/anthonychiu/spool/internal/broker"
+	"github.com/Achiuu13/spool/internal/api"
+	"github.com/Achiuu13/spool/internal/broker"
 )
 
 func main() {
