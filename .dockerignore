@@ -1,0 +1,8 @@
+.git
+bin/
+data*/
+tests/
+benchmarks/
+docs/
+deploy/
+README.md

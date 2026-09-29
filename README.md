@@ -69,6 +69,10 @@ curl -sL -X POST localhost:8082/streams/orders/records -d '{"value":"hi"}'
 curl -s localhost:8082/raft/status
 ```
 
+The same cluster runs on Kubernetes as a StatefulSet with persistent
+volumes and health probes — manifests and a leader-kill demo runbook live
+in [deploy/kubernetes](deploy/kubernetes/README.md).
+
 ## HTTP API
 
 ```sh
@@ -123,8 +127,9 @@ acked-record verification against real broker processes.
 
 ## Status
 
-Stages 1–5 of the build plan are complete: durable log, HTTP broker,
+All six stages of the build plan are complete: durable log, HTTP broker,
 persisted consumer progress, crash tests and benchmarks, multi-partition
 streams with key routing, consumer groups with membership and commit
-fencing, and three-node replication with majority-ack writes and safe
-leader failover. Kubernetes deployment is the remaining milestone.
+fencing, three-node replication with majority-ack writes and safe leader
+failover, and a Kubernetes StatefulSet deployment with persistent volumes
+and probes.

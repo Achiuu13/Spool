@@ -1,0 +1,120 @@
+# Spool: three-node replicated cluster as a StatefulSet.
+#
+# Stable pod names (spool-0/1/2) plus the headless Service give each node a
+# fixed DNS identity for the -peers list, and volumeClaimTemplates give each
+# node its own persistent operation log, so a rescheduled pod comes back with
+# its data and rejoins as a follower.
+---
+# Headless Service: per-pod DNS for peer-to-peer replication traffic.
+# publishNotReadyAddresses is required: readiness needs an elected leader,
+# and electing a leader needs peers to resolve each other first.
+apiVersion: v1
+kind: Service
+metadata:
+  name: spool-headless
+  labels:
+    app: spool
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app: spool
+  ports:
+    - name: http
+      port: 8080
+---
+# Client-facing Service. Routes to ready pods; followers answer with a 307
+# to the leader's per-pod DNS name, which resolves inside the cluster.
+apiVersion: v1
+kind: Service
+metadata:
+  name: spool
+  labels:
+    app: spool
+spec:
+  selector:
+    app: spool
+  ports:
+    - name: http
+      port: 8080
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: spool
+  labels:
+    app: spool
+spec:
+  serviceName: spool-headless
+  replicas: 3
+  # Parallel: nodes must start together to form a quorum; OrderedReady would
+  # wait for spool-0 to be ready (leader elected) before starting spool-1.
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app: spool
+  template:
+    metadata:
+      labels:
+        app: spool
+    spec:
+      containers:
+        - name: broker
+          image: spool:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          args:
+            - -addr
+            - :8080
+            - -data
+            - /data
+            - -node-id
+            - $(POD_NAME)
+            - -peers
+            - spool-0=http://spool-0.spool-headless:8080,spool-1=http://spool-1.spool-headless:8080,spool-2=http://spool-2.spool-headless:8080
+            - -advertise
+            - http://$(POD_NAME).spool-headless:8080
+          ports:
+            - name: http
+              containerPort: 8080
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          # Ready = this node knows an elected leader; a partitioned or
+          # quorum-less node drops out of the client Service.
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 3
+            failureThreshold: 2
+          # Live = the process serves HTTP at all; restarts a hung broker.
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi
