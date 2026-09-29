@@ -12,6 +12,7 @@ import (
 	"strconv"
 
 	"github.com/Achiuu13/spool/internal/broker"
+	"github.com/Achiuu13/spool/internal/groups"
 	spoollog "github.com/Achiuu13/spool/internal/log"
 )
 
@@ -30,9 +31,13 @@ type Server struct {
 func New(b *broker.Broker) *Server {
 	s := &Server{broker: b, mux: http.NewServeMux()}
 	s.mux.HandleFunc("POST /streams/{stream}/records", s.publish)
+	s.mux.HandleFunc("GET /streams/{stream}", s.streamMeta)
 	s.mux.HandleFunc("GET /streams/{stream}/partitions/{partition}/records", s.read)
 	s.mux.HandleFunc("GET /groups/{group}/streams/{stream}/partitions/{partition}/offset", s.getOffset)
 	s.mux.HandleFunc("PUT /groups/{group}/streams/{stream}/partitions/{partition}/offset", s.putOffset)
+	s.mux.HandleFunc("POST /groups/{group}/streams/{stream}/members", s.joinGroup)
+	s.mux.HandleFunc("PUT /groups/{group}/streams/{stream}/members/{member}/heartbeat", s.heartbeat)
+	s.mux.HandleFunc("DELETE /groups/{group}/streams/{stream}/members/{member}", s.leaveGroup)
 	s.mux.HandleFunc("GET /health/live", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
@@ -133,18 +138,54 @@ func (s *Server) putOffset(w http.ResponseWriter, r *http.Request) {
 	}
 	var body struct {
 		NextOffset *int64 `json:"next_offset"`
+		MemberID   string `json:"member_id"`
 	}
 	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096))
 	if err := dec.Decode(&body); err != nil || body.NextOffset == nil || *body.NextOffset < 0 {
 		writeError(w, http.StatusBadRequest, "next_offset must be a non-negative integer")
 		return
 	}
-	err := s.broker.CommitOffset(r.PathValue("group"), r.PathValue("stream"), partition, *body.NextOffset)
+	err := s.broker.CommitOffset(r.PathValue("group"), r.PathValue("stream"), partition, *body.NextOffset, body.MemberID)
 	if err != nil {
 		writeBrokerError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]int64{"next_offset": *body.NextOffset})
+}
+
+func (s *Server) streamMeta(w http.ResponseWriter, r *http.Request) {
+	partitions, err := s.broker.Partitions(r.PathValue("stream"))
+	if err != nil {
+		writeBrokerError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"stream": r.PathValue("stream"), "partitions": partitions})
+}
+
+func (s *Server) joinGroup(w http.ResponseWriter, r *http.Request) {
+	a, err := s.broker.JoinGroup(r.PathValue("group"), r.PathValue("stream"))
+	if err != nil {
+		writeBrokerError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, a)
+}
+
+func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
+	a, err := s.broker.Heartbeat(r.PathValue("group"), r.PathValue("stream"), r.PathValue("member"))
+	if err != nil {
+		writeBrokerError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, a)
+}
+
+func (s *Server) leaveGroup(w http.ResponseWriter, r *http.Request) {
+	if err := s.broker.LeaveGroup(r.PathValue("group"), r.PathValue("stream"), r.PathValue("member")); err != nil {
+		writeBrokerError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func parsePartition(w http.ResponseWriter, r *http.Request) (int, bool) {
@@ -164,6 +205,10 @@ func writeBrokerError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusNotFound, err.Error())
 	case errors.Is(err, spoollog.ErrRecordTooLarge):
 		writeError(w, http.StatusRequestEntityTooLarge, err.Error())
+	case errors.Is(err, groups.ErrUnknownMember):
+		writeError(w, http.StatusNotFound, err.Error())
+	case errors.Is(err, groups.ErrNotOwner):
+		writeError(w, http.StatusConflict, err.Error())
 	default:
 		writeError(w, http.StatusInternalServerError, err.Error())
 	}

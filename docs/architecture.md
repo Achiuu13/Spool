@@ -24,15 +24,17 @@ consumer ──GET  .../records?offset=N──▶ └────┬────
 |---|---|
 | `internal/log` | On-disk record format, append, reads, startup recovery. No HTTP knowledge; fully testable on its own. |
 | `internal/offsets` | Committed next-offset per (group, stream, partition), persisted atomically. |
-| `internal/broker` | Maps stream names to partition logs, validates names, creates streams on first publish. |
+| `internal/groups` | Consumer-group membership: joins, heartbeats, session expiry, range partition assignment, commit fencing. |
+| `internal/broker` | Maps stream names to partition logs, routes records to partitions, validates names, creates streams on first publish. |
 | `internal/api` | HTTP routing, JSON encoding, request validation, error mapping. |
 
 ## On-disk layout
 
 ```
 data/
-  streams/<stream>/0.log     one append-only log per partition (partition 0 only for now)
-  offsets.json               committed consumer progress
+  streams/<stream>/meta.json   partition count, fixed at stream creation
+  streams/<stream>/<p>.log     one append-only log per partition
+  offsets.json                 committed consumer progress
 ```
 
 ## Record format
@@ -83,6 +85,35 @@ The index is rebuilt by scanning on every startup; persisting it is a later
 optimization (recovery of a 10k-record log measures ~67 ms, see
 `benchmarks/results.md`).
 
+## Partitions and routing
+
+A stream's partition count is fixed when the stream is created (broker flag
+`-partitions`, recorded in `meta.json`). Records with a key are routed by
+`FNV-1a(key) % partitions`, so the same key always lands on the same
+partition and stays ordered relative to itself. Keyless records are spread
+round-robin. Each partition has its own log file, offset sequence, and
+index; ordering is guaranteed within a partition, not across partitions.
+
+## Consumer groups
+
+`internal/groups` tracks membership in memory per (group, stream):
+
+- **Join** (`POST /groups/{g}/streams/{s}/members`) returns a server-assigned
+  member id, the group generation, and the member's partitions.
+- **Assignment** is range-based: member ids are sorted and each gets a
+  contiguous span, so every partition has exactly one owner.
+- **Heartbeats** (`PUT .../members/{id}/heartbeat`) refresh the session and
+  return the current assignment; a changed generation tells the consumer it
+  was rebalanced. Members silent past the session timeout (broker flag
+  `-session-timeout`) are dropped and their partitions reassigned.
+- **Fencing**: a commit carrying a `member_id` is rejected (`409`, or `404`
+  after expiry) unless that member currently owns the partition, so a stale
+  member cannot overwrite the new owner's progress. Commits without a
+  `member_id` skip fencing (simple mode for scripts and demos).
+
+Membership is volatile; committed offsets are not. After a broker restart,
+consumers rejoin and resume from persisted offsets.
+
 ## Consumer progress
 
 `offsets.json` holds the committed *next offset to read* per
@@ -97,9 +128,8 @@ consumers must tolerate duplicates.
 
 ## Current limits (by design, this stage)
 
-- Single partition (partition 0) per stream; the API already carries the
-  partition in every path so multi-partition support does not break clients.
+- Partition count is fixed per stream at creation; no repartitioning.
 - Single log file per partition; segments come with retention work.
-- Group names identify persisted progress only — no membership, assignment,
-  or reassignment yet.
+- Group membership is in-memory on one node; it resets on restart (offsets
+  do not).
 - Single node; replication is a separate milestone with its own design doc.

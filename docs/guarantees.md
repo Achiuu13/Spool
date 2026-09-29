@@ -28,9 +28,10 @@ storage failure, filesystem bugs, or power loss.
 - Concurrent producers never receive duplicate offsets, and readers never
   observe a partially written record (frames are checksummed and appends
   are serialized).
-- Ordering is **per partition**. With a single partition this is the whole
-  stream; once multiple partitions exist, no cross-partition order is
-  promised.
+- Ordering is **per partition**; no cross-partition order is promised.
+  Records with the same key always route to the same partition (FNV-1a mod
+  partition count), so per-key order holds. Keyless records are distributed
+  round-robin with no ordering relationship to each other.
 
 ## Recovery
 
@@ -47,10 +48,15 @@ storage failure, filesystem bugs, or power loss.
 - Delivery is **at-least-once**: a consumer that crashes after processing
   but before committing will receive that record again. Consumers must be
   idempotent or otherwise tolerate duplicates.
-- Group names currently identify persisted progress only. There is no
-  membership, exclusive partition assignment, or fencing of stale members
-  yet — two consumers using the same group name will interfere with each
-  other's commits.
+- Within a group, each partition is assigned to at most one active member
+  at a time (range assignment). Members that stop heartbeating past the
+  session timeout are expired and their partitions reassigned.
+- Commits that carry a `member_id` are fenced: a member that expired or
+  lost a partition gets `404`/`409` instead of overwriting the new owner's
+  progress. Commits without `member_id` bypass fencing and are unfenced by
+  design (single-writer scripts).
+- Group membership is in-memory: a broker restart clears it and consumers
+  rejoin. Committed offsets persist across restarts.
 
 ## Limits and validation
 

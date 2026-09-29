@@ -20,8 +20,13 @@ import (
 	"time"
 )
 
+type ack struct {
+	partition int
+	offset    int64
+}
+
 type result struct {
-	offset  int64
+	ack     ack
 	value   string
 	latency time.Duration
 	err     error
@@ -51,8 +56,8 @@ func main() {
 				value := fmt.Sprintf("%d-%d-%s", p, i, payload)
 				body, _ := json.Marshal(map[string]string{"value": value})
 				t0 := time.Now()
-				offset, err := publish(client, *addr, *stream, body)
-				results[p**records+i] = result{offset, value, time.Since(t0), err}
+				a, err := publish(client, *addr, *stream, body)
+				results[p**records+i] = result{a, value, time.Since(t0), err}
 			}
 		}(p)
 	}
@@ -61,16 +66,16 @@ func main() {
 
 	var latencies []time.Duration
 	failed := 0
-	acked := map[int64]string{}
+	acked := map[ack]string{}
 	for _, r := range results {
 		if r.err != nil {
 			failed++
 			continue
 		}
-		if _, dup := acked[r.offset]; dup {
-			log.Fatalf("FAIL: duplicate acknowledged offset %d", r.offset)
+		if _, dup := acked[r.ack]; dup {
+			log.Fatalf("FAIL: duplicate acknowledged offset %d on partition %d", r.ack.offset, r.ack.partition)
 		}
-		acked[r.offset] = r.value
+		acked[r.ack] = r.value
 		latencies = append(latencies, r.latency)
 	}
 	sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
@@ -99,23 +104,24 @@ func main() {
 	}
 }
 
-func publish(client *http.Client, addr, stream string, body []byte) (int64, error) {
+func publish(client *http.Client, addr, stream string, body []byte) (ack, error) {
 	resp, err := client.Post(addr+"/streams/"+stream+"/records", "application/json", bytes.NewReader(body))
 	if err != nil {
-		return 0, err
+		return ack{}, err
 	}
 	defer resp.Body.Close()
 	var out struct {
-		Offset int64  `json:"offset"`
-		Error  string `json:"error"`
+		Partition int    `json:"partition"`
+		Offset    int64  `json:"offset"`
+		Error     string `json:"error"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return 0, err
+		return ack{}, err
 	}
 	if resp.StatusCode != http.StatusOK {
-		return 0, fmt.Errorf("status %d: %s", resp.StatusCode, out.Error)
+		return ack{}, fmt.Errorf("status %d: %s", resp.StatusCode, out.Error)
 	}
-	return out.Offset, nil
+	return ack{out.Partition, out.Offset}, nil
 }
 
 func pct(sorted []time.Duration, p int) time.Duration {
@@ -126,39 +132,57 @@ func pct(sorted []time.Duration, p int) time.Duration {
 	return sorted[idx]
 }
 
-func verifyAcked(client *http.Client, addr, stream string, acked map[int64]string) int {
-	got := map[int64]string{}
-	offset := int64(0)
-	for {
-		url := fmt.Sprintf("%s/streams/%s/partitions/0/records?offset=%d&limit=1000", addr, stream, offset)
-		resp, err := client.Get(url)
-		if err != nil {
-			log.Fatalf("verify read: %v", err)
+func verifyAcked(client *http.Client, addr, stream string, acked map[ack]string) int {
+	partitions := streamPartitions(client, addr, stream)
+	got := map[ack]string{}
+	for p := 0; p < partitions; p++ {
+		offset := int64(0)
+		for {
+			url := fmt.Sprintf("%s/streams/%s/partitions/%d/records?offset=%d&limit=1000", addr, stream, p, offset)
+			resp, err := client.Get(url)
+			if err != nil {
+				log.Fatalf("verify read: %v", err)
+			}
+			var out struct {
+				Records []struct {
+					Offset int64  `json:"offset"`
+					Value  string `json:"value"`
+				} `json:"records"`
+				NextOffset int64 `json:"next_offset"`
+			}
+			if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+				log.Fatalf("verify decode: %v", err)
+			}
+			resp.Body.Close()
+			if len(out.Records) == 0 {
+				break
+			}
+			for _, r := range out.Records {
+				got[ack{p, r.Offset}] = r.Value
+			}
+			offset = out.NextOffset
 		}
-		var out struct {
-			Records []struct {
-				Offset int64  `json:"offset"`
-				Value  string `json:"value"`
-			} `json:"records"`
-			NextOffset int64 `json:"next_offset"`
-		}
-		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-			log.Fatalf("verify decode: %v", err)
-		}
-		resp.Body.Close()
-		if len(out.Records) == 0 {
-			break
-		}
-		for _, r := range out.Records {
-			got[r.Offset] = r.Value
-		}
-		offset = out.NextOffset
 	}
 	missing := 0
-	for off, want := range acked {
-		if got[off] != want {
+	for a, want := range acked {
+		if got[a] != want {
 			missing++
 		}
 	}
 	return missing
+}
+
+func streamPartitions(client *http.Client, addr, stream string) int {
+	resp, err := client.Get(addr + "/streams/" + stream)
+	if err != nil {
+		log.Fatalf("stream meta: %v", err)
+	}
+	defer resp.Body.Close()
+	var out struct {
+		Partitions int `json:"partitions"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil || out.Partitions < 1 {
+		log.Fatalf("stream meta: %v (partitions=%d)", err, out.Partitions)
+	}
+	return out.Partitions
 }
