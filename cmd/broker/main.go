@@ -1,0 +1,55 @@
+// Broker executable: serves the Spool HTTP API over a local data directory.
+package main
+
+import (
+	"context"
+	"errors"
+	"flag"
+	"log"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/anthonychiu/spool/internal/api"
+	"github.com/anthonychiu/spool/internal/broker"
+)
+
+func main() {
+	addr := flag.String("addr", ":8080", "listen address")
+	dataDir := flag.String("data", "data", "data directory")
+	sync := flag.Bool("sync", true, "fsync each append before acknowledging (durable mode)")
+	flag.Parse()
+
+	b, err := broker.Open(broker.Options{DataDir: *dataDir, SyncEveryAppend: *sync})
+	if err != nil {
+		log.Fatalf("spool: %v", err)
+	}
+
+	srv := &http.Server{
+		Addr:         *addr,
+		Handler:      api.New(b),
+		ReadTimeout:  10 * time.Second,
+		WriteTimeout: 30 * time.Second,
+		IdleTimeout:  60 * time.Second,
+	}
+
+	go func() {
+		log.Printf("spool: listening on %s (data=%s sync=%v)", *addr, *dataDir, *sync)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Fatalf("spool: %v", err)
+		}
+	}()
+
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+	<-stop
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	srv.Shutdown(ctx)
+	if err := b.Close(); err != nil {
+		log.Printf("spool: close: %v", err)
+	}
+}
