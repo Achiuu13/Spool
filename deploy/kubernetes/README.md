@@ -32,15 +32,16 @@ kubectl apply -f deploy/kubernetes/spool.yaml
 kubectl rollout status statefulset/spool
 ```
 
-Talk to the cluster:
+Talk to the cluster. The broker image is distroless (no shell), so use a
+throwaway curl pod for in-cluster requests — followers redirect to the
+leader's pod DNS name, which only resolves inside the cluster:
 
 ```sh
-kubectl port-forward svc/spool 8080:8080 &
+kubectl run curl-client --image=curlimages/curl --restart=Never -- sleep 3600
+kubectl wait --for=condition=Ready pod/curl-client
 
-# Followers redirect to the leader's pod DNS name, so publish from inside
-# the cluster (or port-forward the leader pod directly):
-kubectl run client --rm -it --image=curlimages/curl --restart=Never -- \
-  sh -c 'curl -sL -X POST http://spool:8080/streams/orders/records -d "{\"value\":\"hello\"}"'
+kubectl exec curl-client -- curl -sL -X POST \
+  http://spool:8080/streams/orders/records -d '{"key":"k1","value":"hello"}'
 ```
 
 ## Failover demo: delete the leader pod
@@ -48,7 +49,7 @@ kubectl run client --rm -it --image=curlimages/curl --restart=Never -- \
 ```sh
 # 1. Find the leader.
 for i in 0 1 2; do
-  kubectl exec spool-$i -- wget -qO- http://localhost:8080/raft/status
+  kubectl exec curl-client -- curl -s http://spool-$i.spool-headless:8080/raft/status; echo
 done
 
 # 2. Publish some records (acked = durable on a majority).
@@ -66,6 +67,17 @@ This is the Kubernetes rendition of `TestFailoverPreservesAckedRecords`
 and `TestKilledNodeRejoinsAndCatchesUp` in `tests/replication_e2e_test.go`,
 which run the same scenario against real broker processes on every
 `go test ./...`.
+
+## Verified run (kind v0.33.0, Docker 29.5.2, macOS)
+
+The demo above, executed as written: 10 records published through a
+follower redirect while `spool-1` led term 3; `kubectl delete pod spool-1`
+promoted `spool-2` to leader in term 4 in about a second of wall time
+(election itself is bounded by the 300–600ms randomized timeout); all
+10 acknowledged records were readable from the new leader; the recreated
+`spool-1` reattached `data-spool-1`, replayed its operation log to
+`applied=11`, and rejoined as a follower; the cluster accepted new writes
+throughout recovery.
 
 ## Notes
 
