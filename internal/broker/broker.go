@@ -83,7 +83,7 @@ func Open(opts Options) (*Broker, error) {
 		if !e.IsDir() || !streamNameRE.MatchString(e.Name()) {
 			continue
 		}
-		if _, err := b.openStreamLocked(e.Name(), false); err != nil {
+		if _, err := b.openStreamLocked(e.Name(), 0); err != nil {
 			b.Close()
 			return nil, fmt.Errorf("broker: recover stream %q: %w", e.Name(), err)
 		}
@@ -92,9 +92,9 @@ func Open(opts Options) (*Broker, error) {
 }
 
 // openStreamLocked opens an existing stream directory, or creates one with
-// the default partition count when create is true. Caller need not hold mu
+// createWith partitions when createWith > 0. Caller need not hold mu
 // during Open (single-threaded); at runtime it is called under mu.
-func (b *Broker) openStreamLocked(name string, create bool) (*stream, error) {
+func (b *Broker) openStreamLocked(name string, createWith int) (*stream, error) {
 	dir := filepath.Join(b.opts.DataDir, "streams", name)
 	metaPath := filepath.Join(dir, "meta.json")
 	var meta streamMeta
@@ -105,11 +105,11 @@ func (b *Broker) openStreamLocked(name string, create bool) (*stream, error) {
 			return nil, fmt.Errorf("broker: corrupt meta for stream %q", name)
 		}
 	case os.IsNotExist(err):
-		if _, statErr := os.Stat(dir); statErr == nil && !create {
+		if _, statErr := os.Stat(dir); statErr == nil && createWith <= 0 {
 			// Pre-partitioning data directory: single partition.
 			meta.Partitions = 1
-		} else if create {
-			meta.Partitions = b.opts.DefaultPartitions
+		} else if createWith > 0 {
+			meta.Partitions = createWith
 			if err := os.MkdirAll(dir, 0o755); err != nil {
 				return nil, err
 			}
@@ -141,6 +141,16 @@ func (b *Broker) openStreamLocked(name string, create bool) (*stream, error) {
 }
 
 func (b *Broker) stream(name string, create bool) (*stream, error) {
+	createWith := 0
+	if create {
+		createWith = b.opts.DefaultPartitions
+	}
+	return b.streamWithCount(name, createWith)
+}
+
+// streamWithCount returns the stream, creating it with createWith partitions
+// when createWith > 0 and it does not exist yet.
+func (b *Broker) streamWithCount(name string, createWith int) (*stream, error) {
 	if !streamNameRE.MatchString(name) {
 		return nil, ErrInvalidStream
 	}
@@ -149,10 +159,10 @@ func (b *Broker) stream(name string, create bool) (*stream, error) {
 	if s, ok := b.streams[name]; ok {
 		return s, nil
 	}
-	if !create {
+	if createWith <= 0 {
 		return nil, ErrNoSuchStream
 	}
-	return b.openStreamLocked(name, true)
+	return b.openStreamLocked(name, createWith)
 }
 
 // route picks the partition for a record: FNV-1a hash of the key modulo the

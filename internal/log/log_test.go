@@ -242,3 +242,68 @@ func TestEmptyLogReadsEmpty(t *testing.T) {
 		t.Fatalf("Read on empty log = %v, %v", recs, err)
 	}
 }
+
+func TestTruncateFromRemovesSuffix(t *testing.T) {
+	l, path := openTemp(t)
+	for i := 0; i < 5; i++ {
+		if _, err := l.Append(nil, []byte(fmt.Sprintf("v%d", i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := l.TruncateFrom(3); err != nil {
+		t.Fatal(err)
+	}
+	if l.NextOffset() != 3 {
+		t.Fatalf("NextOffset = %d, want 3", l.NextOffset())
+	}
+	// Appends continue from the truncation point.
+	off, err := l.Append(nil, []byte("replacement"))
+	if err != nil || off != 3 {
+		t.Fatalf("append after truncate = %d, %v; want offset 3", off, err)
+	}
+	l.Close()
+
+	// The truncation is durable.
+	l2, err := Open(path, Options{SyncEveryAppend: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l2.Close()
+	recs, err := l2.Read(0, 100)
+	if err != nil || len(recs) != 4 {
+		t.Fatalf("after reopen: %d records, %v; want 4", len(recs), err)
+	}
+	if string(recs[3].Value) != "replacement" {
+		t.Fatalf("record 3 = %q, want replacement", recs[3].Value)
+	}
+}
+
+func TestTruncateFromPastEndIsNoop(t *testing.T) {
+	l, _ := openTemp(t)
+	defer l.Close()
+	l.Append(nil, []byte("v"))
+	if err := l.TruncateFrom(5); err != nil {
+		t.Fatal(err)
+	}
+	if l.NextOffset() != 1 {
+		t.Fatalf("NextOffset = %d, want 1", l.NextOffset())
+	}
+	if err := l.TruncateFrom(-1); err != ErrOffsetOutOfRange {
+		t.Fatalf("negative truncate err = %v", err)
+	}
+}
+
+func TestAppendRecordUsesExplicitTimestamp(t *testing.T) {
+	l, _ := openTemp(t)
+	defer l.Close()
+	if _, err := l.AppendRecord(42, []byte("k"), []byte("v")); err != nil {
+		t.Fatal(err)
+	}
+	recs, err := l.Read(0, 1)
+	if err != nil || len(recs) != 1 {
+		t.Fatal(err)
+	}
+	if recs[0].Timestamp != 42 {
+		t.Fatalf("timestamp = %d, want 42", recs[0].Timestamp)
+	}
+}

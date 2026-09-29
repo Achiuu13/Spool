@@ -12,10 +12,14 @@ disconnect or the broker restarts — acknowledged records survive `kill -9`.
   corruption is reported, never silently skipped.
 - **At-least-once consumers**: committed progress per group survives
   restarts and crashes.
+- **Replicated**: in cluster mode, writes are acknowledged only after a
+  majority of three nodes has them durably; acked records survive losing
+  the leader.
 
-See [docs/architecture.md](docs/architecture.md) for the design and
+See [docs/architecture.md](docs/architecture.md) for the design,
 [docs/guarantees.md](docs/guarantees.md) for exactly what is and is not
-promised. Measured results live in [benchmarks/results.md](benchmarks/results.md).
+promised, and [docs/replication.md](docs/replication.md) for the failover
+design. Measured results live in [benchmarks/results.md](benchmarks/results.md).
 
 ## Quick start
 
@@ -46,6 +50,23 @@ go build -o bin/ ./cmd/...
 #    kill one and the survivor takes over its partitions.
 ./bin/consumer -stream orders -group workers &
 ./bin/consumer -stream orders -group workers
+```
+
+### Three-node cluster
+
+```sh
+PEERS="n1=http://127.0.0.1:8081,n2=http://127.0.0.1:8082,n3=http://127.0.0.1:8083"
+./bin/broker -addr :8081 -data data-n1 -node-id n1 -peers "$PEERS" &
+./bin/broker -addr :8082 -data data-n2 -node-id n2 -peers "$PEERS" &
+./bin/broker -addr :8083 -data data-n3 -node-id n3 -peers "$PEERS" &
+
+# Publish to any node: followers redirect (307) to the elected leader, and
+# the ack means a majority has the record durably on disk.
+curl -sL -X POST localhost:8082/streams/orders/records -d '{"value":"hi"}'
+
+# Kill the leader (see /raft/status); a new leader takes over in well under
+# a second, and every acknowledged record is still readable.
+curl -s localhost:8082/raft/status
 ```
 
 ## HTTP API
@@ -95,12 +116,15 @@ The test suite covers ordered reads, replay, restart persistence,
 torn-write truncation, mid-log corruption detection, concurrent-publish
 offset uniqueness, at-least-once redelivery, committed-progress survival
 across SIGKILL, deterministic key routing, group assignment invariants,
-timeout-driven reassignment, and stale-member commit fencing.
+timeout-driven reassignment, stale-member commit fencing, leader election,
+majority-ack commits, follower catch-up after downtime, stale-leader
+truncation, quorum-loss write rejection, and leader-kill failover with
+acked-record verification against real broker processes.
 
 ## Status
 
-Stages 1–4 of the build plan are complete: durable log, HTTP broker,
+Stages 1–5 of the build plan are complete: durable log, HTTP broker,
 persisted consumer progress, crash tests and benchmarks, multi-partition
-streams with key routing, and consumer groups with membership, heartbeats,
-reassignment, and commit fencing. Three-node replication with safe failover
-and Kubernetes deployment are the remaining milestones.
+streams with key routing, consumer groups with membership and commit
+fencing, and three-node replication with majority-ack writes and safe
+leader failover. Kubernetes deployment is the remaining milestone.

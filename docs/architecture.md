@@ -126,10 +126,27 @@ Consumer flow (at-least-once): read record → process record → commit
 `offset+1`. A crash between processing and commit redelivers the record, so
 consumers must tolerate duplicates.
 
+## Replication (cluster mode)
+
+With `-peers`, Spool runs as a three-node cluster. Every state change
+(publish, offset commit) becomes an entry in a single Raft-style replicated
+operation log (`data/raft/oplog`, reusing the stage-1 framed log with
+fsync-per-append). The elected leader accepts all client traffic; followers
+answer with `307` redirects to it. A publish is acknowledged only after the
+entry is durable on a majority, and every node applies committed entries in
+log order to rebuild identical derived state (partition logs and offsets
+under `data/state/`). Leader election, catch-up, conflict truncation, and
+stale-leader fencing are covered in [replication.md](replication.md).
+
+Without `-peers`, the replication layer is absent and everything above
+describes the whole system.
+
 ## Current limits (by design, this stage)
 
 - Partition count is fixed per stream at creation; no repartitioning.
 - Single log file per partition; segments come with retention work.
-- Group membership is in-memory on one node; it resets on restart (offsets
-  do not).
-- Single node; replication is a separate milestone with its own design doc.
+- Group membership is in-memory on the leader; it resets on restart or
+  failover (offsets do not) and consumers re-join, as they already do on
+  session expiry.
+- The replicated operation log is never compacted; cluster-mode restart
+  replays it from the start.

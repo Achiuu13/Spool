@@ -10,10 +10,12 @@ import (
 	"errors"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/Achiuu13/spool/internal/broker"
 	"github.com/Achiuu13/spool/internal/groups"
 	spoollog "github.com/Achiuu13/spool/internal/log"
+	"github.com/Achiuu13/spool/internal/replication"
 )
 
 const (
@@ -22,29 +24,65 @@ const (
 	maxLimit       = 1000
 )
 
+// Replication is the cluster coordination surface the API needs: leadership
+// checks for redirects and Propose for replicated writes. nil means
+// standalone mode.
+type Replication interface {
+	IsLeader() bool
+	LeaderURL() string
+	Propose(op []byte) (any, error)
+}
+
 // Server routes HTTP requests to a broker.
 type Server struct {
 	broker *broker.Broker
+	repl   Replication
 	mux    *http.ServeMux
 }
 
-func New(b *broker.Broker) *Server {
-	s := &Server{broker: b, mux: http.NewServeMux()}
-	s.mux.HandleFunc("POST /streams/{stream}/records", s.publish)
-	s.mux.HandleFunc("GET /streams/{stream}", s.streamMeta)
-	s.mux.HandleFunc("GET /streams/{stream}/partitions/{partition}/records", s.read)
-	s.mux.HandleFunc("GET /groups/{group}/streams/{stream}/partitions/{partition}/offset", s.getOffset)
-	s.mux.HandleFunc("PUT /groups/{group}/streams/{stream}/partitions/{partition}/offset", s.putOffset)
-	s.mux.HandleFunc("POST /groups/{group}/streams/{stream}/members", s.joinGroup)
-	s.mux.HandleFunc("PUT /groups/{group}/streams/{stream}/members/{member}/heartbeat", s.heartbeat)
-	s.mux.HandleFunc("DELETE /groups/{group}/streams/{stream}/members/{member}", s.leaveGroup)
+func New(b *broker.Broker) *Server { return NewReplicated(b, nil) }
+
+// NewReplicated builds a Server that routes writes through the replication
+// layer and redirects all client traffic on non-leaders to the leader.
+func NewReplicated(b *broker.Broker, repl Replication) *Server {
+	s := &Server{broker: b, repl: repl, mux: http.NewServeMux()}
+	s.mux.HandleFunc("POST /streams/{stream}/records", s.leaderOnly(s.publish))
+	s.mux.HandleFunc("GET /streams/{stream}", s.leaderOnly(s.streamMeta))
+	s.mux.HandleFunc("GET /streams/{stream}/partitions/{partition}/records", s.leaderOnly(s.read))
+	s.mux.HandleFunc("GET /groups/{group}/streams/{stream}/partitions/{partition}/offset", s.leaderOnly(s.getOffset))
+	s.mux.HandleFunc("PUT /groups/{group}/streams/{stream}/partitions/{partition}/offset", s.leaderOnly(s.putOffset))
+	s.mux.HandleFunc("POST /groups/{group}/streams/{stream}/members", s.leaderOnly(s.joinGroup))
+	s.mux.HandleFunc("PUT /groups/{group}/streams/{stream}/members/{member}/heartbeat", s.leaderOnly(s.heartbeat))
+	s.mux.HandleFunc("DELETE /groups/{group}/streams/{stream}/members/{member}", s.leaderOnly(s.leaveGroup))
 	s.mux.HandleFunc("GET /health/live", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
 	s.mux.HandleFunc("GET /health/ready", func(w http.ResponseWriter, r *http.Request) {
+		if s.repl != nil && s.repl.LeaderURL() == "" {
+			writeError(w, http.StatusServiceUnavailable, "no leader elected")
+			return
+		}
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
 	return s
+}
+
+// leaderOnly redirects client traffic to the leader in cluster mode, so
+// clients always observe committed state and writes have a single entry
+// point. Standalone mode passes through.
+func (s *Server) leaderOnly(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if s.repl != nil && !s.repl.IsLeader() {
+			leaderURL := s.repl.LeaderURL()
+			if leaderURL == "" {
+				writeError(w, http.StatusServiceUnavailable, "no leader elected")
+				return
+			}
+			http.Redirect(w, r, leaderURL+r.URL.RequestURI(), http.StatusTemporaryRedirect)
+			return
+		}
+		next(w, r)
+	}
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) { s.mux.ServeHTTP(w, r) }
@@ -78,12 +116,36 @@ func (s *Server) publish(w http.ResponseWriter, r *http.Request) {
 	if body.Key != "" {
 		key = []byte(body.Key)
 	}
-	partition, offset, err := s.broker.Publish(r.PathValue("stream"), key, []byte(body.Value))
+	stream := r.PathValue("stream")
+	if s.repl == nil {
+		partition, offset, err := s.broker.Publish(stream, key, []byte(body.Value))
+		if err != nil {
+			writeBrokerError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"partition": partition, "offset": offset})
+		return
+	}
+
+	// Cluster mode: resolve the partition here, then replicate. The record
+	// is acknowledged only after a majority has it durably.
+	partition, total, err := s.broker.ChoosePartition(stream, key)
 	if err != nil {
 		writeBrokerError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"partition": partition, "offset": offset})
+	op, _ := json.Marshal(broker.Op{
+		Type: broker.OpPublish, Stream: stream,
+		Partitions: total, Partition: partition,
+		Timestamp: time.Now().UnixNano(), Key: key, Value: []byte(body.Value),
+	})
+	res, err := s.repl.Propose(op)
+	if err != nil {
+		writeReplicationError(w, err)
+		return
+	}
+	pr := res.(broker.PublishResult)
+	writeJSON(w, http.StatusOK, map[string]any{"partition": pr.Partition, "offset": pr.Offset})
 }
 
 func (s *Server) read(w http.ResponseWriter, r *http.Request) {
@@ -145,9 +207,28 @@ func (s *Server) putOffset(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "next_offset must be a non-negative integer")
 		return
 	}
-	err := s.broker.CommitOffset(r.PathValue("group"), r.PathValue("stream"), partition, *body.NextOffset, body.MemberID)
-	if err != nil {
+	group, stream := r.PathValue("group"), r.PathValue("stream")
+	if s.repl == nil {
+		if err := s.broker.CommitOffset(group, stream, partition, *body.NextOffset, body.MemberID); err != nil {
+			writeBrokerError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]int64{"next_offset": *body.NextOffset})
+		return
+	}
+
+	// Cluster mode: fence on the leader (membership is leader-local), then
+	// replicate the commit so it survives failover.
+	if err := s.broker.AuthorizeCommit(group, stream, partition, body.MemberID); err != nil {
 		writeBrokerError(w, err)
+		return
+	}
+	op, _ := json.Marshal(broker.Op{
+		Type: broker.OpCommitOffset, Group: group, Stream: stream,
+		Partition: partition, NextOffset: *body.NextOffset,
+	})
+	if _, err := s.repl.Propose(op); err != nil {
+		writeReplicationError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]int64{"next_offset": *body.NextOffset})
@@ -195,6 +276,17 @@ func parsePartition(w http.ResponseWriter, r *http.Request) (int, bool) {
 		return 0, false
 	}
 	return partition, true
+}
+
+// writeReplicationError maps proposal failures: leadership lost mid-request
+// or no quorum both mean the client should retry (possibly elsewhere).
+func writeReplicationError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, replication.ErrNotLeader), errors.Is(err, replication.ErrNoQuorum):
+		writeError(w, http.StatusServiceUnavailable, err.Error())
+	default:
+		writeBrokerError(w, err)
+	}
 }
 
 func writeBrokerError(w http.ResponseWriter, err error) {
