@@ -14,15 +14,23 @@ import (
 
 	"github.com/Achiuu13/spool/internal/api"
 	"github.com/Achiuu13/spool/internal/broker"
+	"github.com/Achiuu13/spool/internal/groups"
 )
 
 func main() {
 	addr := flag.String("addr", ":8080", "listen address")
 	dataDir := flag.String("data", "data", "data directory")
 	sync := flag.Bool("sync", true, "fsync each append before acknowledging (durable mode)")
+	partitions := flag.Int("partitions", 3, "partition count for newly created streams")
+	sessionTimeout := flag.Duration("session-timeout", 10*time.Second, "consumer-group session timeout")
 	flag.Parse()
 
-	b, err := broker.Open(broker.Options{DataDir: *dataDir, SyncEveryAppend: *sync})
+	b, err := broker.Open(broker.Options{
+		DataDir:           *dataDir,
+		SyncEveryAppend:   *sync,
+		DefaultPartitions: *partitions,
+		Groups:            groups.Options{SessionTimeout: *sessionTimeout},
+	})
 	if err != nil {
 		log.Fatalf("spool: %v", err)
 	}

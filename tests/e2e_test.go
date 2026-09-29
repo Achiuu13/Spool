@@ -46,9 +46,10 @@ func freePort(t *testing.T) int {
 	return l.Addr().(*net.TCPAddr).Port
 }
 
-func startBroker(t *testing.T, dataDir string, port int) *exec.Cmd {
+func startBroker(t *testing.T, dataDir string, port int, extra ...string) *exec.Cmd {
 	t.Helper()
-	cmd := exec.Command(brokerBin, "-addr", fmt.Sprintf("127.0.0.1:%d", port), "-data", dataDir)
+	args := append([]string{"-addr", fmt.Sprintf("127.0.0.1:%d", port), "-data", dataDir}, extra...)
+	cmd := exec.Command(brokerBin, args...)
 	cmd.Stdout = os.Stderr
 	cmd.Stderr = os.Stderr
 	if err := cmd.Start(); err != nil {
@@ -130,7 +131,7 @@ func TestCrashRecoveryPreservesAckedRecords(t *testing.T) {
 	dataDir := t.TempDir()
 	port := freePort(t)
 	base := fmt.Sprintf("http://127.0.0.1:%d", port)
-	cmd := startBroker(t, dataDir, port)
+	cmd := startBroker(t, dataDir, port, "-partitions", "1")
 
 	const producers, perProducer = 8, 25
 	type ack struct {
@@ -170,7 +171,7 @@ func TestCrashRecoveryPreservesAckedRecords(t *testing.T) {
 	}
 	cmd.Wait()
 
-	cmd2 := startBroker(t, dataDir, port)
+	cmd2 := startBroker(t, dataDir, port, "-partitions", "1")
 	defer func() { cmd2.Process.Kill(); cmd2.Wait() }()
 
 	got := readAll(t, base, "orders")
@@ -187,7 +188,7 @@ func TestRestartPreservesOffsets(t *testing.T) {
 	dataDir := t.TempDir()
 	port := freePort(t)
 	base := fmt.Sprintf("http://127.0.0.1:%d", port)
-	cmd := startBroker(t, dataDir, port)
+	cmd := startBroker(t, dataDir, port, "-partitions", "1")
 
 	for i := 0; i < 3; i++ {
 		off, err := publishOne(base, "orders", "", fmt.Sprintf("v%d", i))
@@ -198,7 +199,7 @@ func TestRestartPreservesOffsets(t *testing.T) {
 	cmd.Process.Signal(syscall.SIGTERM)
 	cmd.Wait()
 
-	cmd2 := startBroker(t, dataDir, port)
+	cmd2 := startBroker(t, dataDir, port, "-partitions", "1")
 	defer func() { cmd2.Process.Kill(); cmd2.Wait() }()
 	got := readAll(t, base, "orders")
 	if len(got) != 3 || got[0] != "v0" || got[2] != "v2" {
@@ -216,7 +217,7 @@ func TestAtLeastOnceRedelivery(t *testing.T) {
 	dataDir := t.TempDir()
 	port := freePort(t)
 	base := fmt.Sprintf("http://127.0.0.1:%d", port)
-	cmd := startBroker(t, dataDir, port)
+	cmd := startBroker(t, dataDir, port, "-partitions", "1")
 	defer func() { cmd.Process.Kill(); cmd.Wait() }()
 
 	for i := 0; i < 2; i++ {
@@ -265,7 +266,7 @@ func TestCommittedProgressSurvivesCrash(t *testing.T) {
 	dataDir := t.TempDir()
 	port := freePort(t)
 	base := fmt.Sprintf("http://127.0.0.1:%d", port)
-	cmd := startBroker(t, dataDir, port)
+	cmd := startBroker(t, dataDir, port, "-partitions", "1")
 
 	for i := 0; i < 5; i++ {
 		publishOne(base, "orders", "", fmt.Sprintf("v%d", i))
@@ -280,7 +281,7 @@ func TestCommittedProgressSurvivesCrash(t *testing.T) {
 
 	cmd.Process.Signal(syscall.SIGKILL)
 	cmd.Wait()
-	cmd2 := startBroker(t, dataDir, port)
+	cmd2 := startBroker(t, dataDir, port, "-partitions", "1")
 	defer func() { cmd2.Process.Kill(); cmd2.Wait() }()
 
 	resp2, err := http.Get(offsetURL)
